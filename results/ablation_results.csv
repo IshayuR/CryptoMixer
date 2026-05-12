@@ -1,0 +1,5 @@
+Variant,AUROC
+Full Model,0.82
+No Temporal Stream,0.56
+No User Stream,0.74
+No Market Mixer,0.7
