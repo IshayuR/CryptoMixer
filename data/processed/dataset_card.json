@@ -1,0 +1,38 @@
+{
+  "dataset_name": "uniswap_v2_usdc_eth_uniswap_snapshot",
+  "canonical_files": [
+    "data/uniswap_v2_usdc_eth_processed_uniswap.csv",
+    "data/uniswap_v2_usdc_eth_train_uniswap.csv",
+    "data/uniswap_v2_usdc_eth_val_uniswap.csv",
+    "data/uniswap_v2_usdc_eth_test_uniswap.csv"
+  ],
+  "pool_address": "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc",
+  "data_source_summary": {
+    "the_graph_uniswap_v2": 700,
+    "synthetic_demo": 300
+  },
+  "num_rows": 1000,
+  "num_unique_wallets": 198,
+  "start_timestamp": "2024-01-01 15:55:53",
+  "end_timestamp": "2024-06-29 03:09:15",
+  "split_strategy": "chronological_80_10_10",
+  "split_sizes": {
+    "train": 800,
+    "val": 100,
+    "test": 100
+  },
+  "columns": [
+    "timestamp",
+    "transaction_id",
+    "sender",
+    "amountUSD",
+    "amount0In",
+    "amount1In",
+    "amount0Out",
+    "amount1Out",
+    "trade_direction",
+    "estimated_eth_price",
+    "pool_address",
+    "data_source"
+  ]
+}

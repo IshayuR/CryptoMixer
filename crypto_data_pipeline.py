@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path("results/.mplconfig").resolve()))
@@ -12,16 +13,43 @@ import datetime
 
 print("Initiating GraphQL connection to Uniswap V2 Subgraph...")
 
+POOL_ADDRESS = "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc"
+PROCESSED_DIR = Path("data/processed")
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+GRAPH_API_KEY = os.environ.get("GRAPH_API_KEY", "").strip()
+FETCH_LIMIT = int(os.environ.get("GRAPH_FETCH_LIMIT", "1000"))
+MAX_PAGES = int(os.environ.get("GRAPH_MAX_PAGES", "5"))
+START_DATE = os.environ.get("GRAPH_START_DATE", "2022-01-01")
+END_DATE = os.environ.get("GRAPH_END_DATE", "2022-12-31")
+
 # 1. Query Real Data from the Uniswap V2 API (USDC-ETH Pool)
-# The Graph decentralized network endpoint (free API key from https://thegraph.com/studio/)
-API_KEY = ""  # Paste your free API key here
+# The Graph requires an API key for subgraph queries.
 SUBGRAPH_ID = "A3Np3RQbaBA6oKJgiwDJeo5T3zrYfGHPWFYayMwtNDum"  # Uniswap V2
 
-url = f"https://gateway.thegraph.com/api/{API_KEY}/subgraphs/id/{SUBGRAPH_ID}" if API_KEY else None
-query = """
-{
-  swaps(first: 1000, orderBy: timestamp, orderDirection: desc, where: { pair: "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc" }) {
-    transaction { id }
+url = f"https://gateway.thegraph.com/api/{GRAPH_API_KEY}/subgraphs/id/{SUBGRAPH_ID}" if GRAPH_API_KEY else None
+
+
+def to_unix_timestamp(date_str: str, end_of_day: bool = False) -> int:
+    parsed = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+    if end_of_day:
+        parsed = parsed + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+    return int(parsed.replace(tzinfo=datetime.timezone.utc).timestamp())
+
+
+def build_query(first: int, start_ts: int, end_ts: int) -> str:
+    return f"""
+{{
+  swaps(
+    first: {first},
+    orderBy: timestamp,
+    orderDirection: asc,
+    where: {{
+      pair: "{POOL_ADDRESS}",
+      timestamp_gt: {start_ts},
+      timestamp_lte: {end_ts}
+    }}
+  ) {{
+    transaction {{ id }}
     timestamp
     sender
     amount0In
@@ -29,19 +57,59 @@ query = """
     amount0Out
     amount1Out
     amountUSD
-  }
-}
+  }}
+}}
 """
 
+
+def fetch_real_swaps(graph_url: str, start_ts: int, end_ts: int) -> list[dict]:
+    rows: list[dict] = []
+    cursor_ts = start_ts - 1
+
+    for _ in range(MAX_PAGES):
+        query = build_query(FETCH_LIMIT, cursor_ts, end_ts)
+        response = requests.post(graph_url, json={"query": query}, timeout=60)
+        response.raise_for_status()
+        json_body = response.json()
+
+        if json_body.get("errors"):
+            raise RuntimeError(f"The Graph returned errors: {json_body['errors']}")
+
+        batch = json_body.get("data", {}).get("swaps", [])
+        if not batch:
+            break
+
+        rows.extend(batch)
+        cursor_ts = int(batch[-1]["timestamp"])
+
+        if len(batch) < FETCH_LIMIT:
+            break
+
+    return rows
+
 data = None
+data_source = "synthetic_demo"
+query_window = {
+    "start_date": START_DATE,
+    "end_date": END_DATE,
+    "start_timestamp": to_unix_timestamp(START_DATE),
+    "end_timestamp": to_unix_timestamp(END_DATE, end_of_day=True),
+}
+
 if url:
-    response = requests.post(url, json={'query': query})
-    json_body = response.json()
-    if response.status_code == 200 and json_body.get('data'):
-        data = json_body['data']['swaps']
-        print("Data successfully fetched from the Ethereum Blockchain!")
-    else:
-        print(f"API returned an error: {json_body.get('errors', 'unknown')}")
+    try:
+        data = fetch_real_swaps(
+            url,
+            start_ts=query_window["start_timestamp"],
+            end_ts=query_window["end_timestamp"],
+        )
+        if data:
+            data_source = "the_graph_uniswap_v2"
+            print(f"Fetched {len(data)} swaps from The Graph for {START_DATE} to {END_DATE}.")
+        else:
+            print("The Graph query succeeded but returned no swaps for the requested window.")
+    except Exception as exc:
+        print(f"The Graph query failed: {exc}")
 
 if data is None:
     print("Generating synthetic USDC-ETH swap data for pipeline demonstration...")
@@ -68,6 +136,9 @@ if data is None:
 
 # 2. Convert JSON to Pandas DataFrame
 df = pd.DataFrame(data)
+df["transaction_id"] = df["transaction"].apply(lambda x: x.get("id") if isinstance(x, dict) else None)
+df["pool_address"] = POOL_ADDRESS
+df["data_source"] = data_source
 
 # 3. Clean and format the data
 df['timestamp'] = pd.to_datetime(df['timestamp'].astype(int), unit='s')
@@ -76,10 +147,65 @@ df['amount0In'] = df['amount0In'].astype(float) # USDC
 df['amount1In'] = df['amount1In'].astype(float) # ETH
 df['amount0Out'] = df['amount0Out'].astype(float)
 df['amount1Out'] = df['amount1Out'].astype(float)
+df['trade_direction'] = np.where(df['amount0In'] > 0, 'buy_eth_with_usdc', 'sell_eth_for_usdc')
+df['estimated_eth_price'] = np.where(
+    df['amount1Out'] > 0,
+    df['amountUSD'] / np.maximum(df['amount1Out'], 1e-12),
+    np.where(df['amount1In'] > 0, df['amountUSD'] / np.maximum(df['amount1In'], 1e-12), np.nan),
+)
+df = df.sort_values('timestamp').reset_index(drop=True)
+
+processed_columns = [
+    'timestamp',
+    'transaction_id',
+    'sender',
+    'amountUSD',
+    'amount0In',
+    'amount1In',
+    'amount0Out',
+    'amount1Out',
+    'trade_direction',
+    'estimated_eth_price',
+    'pool_address',
+    'data_source',
+]
+processed_df = df[processed_columns].copy()
+
+train_end = int(len(processed_df) * 0.8)
+val_end = int(len(processed_df) * 0.9)
+split_dfs = {
+    'train': processed_df.iloc[:train_end].copy(),
+    'val': processed_df.iloc[train_end:val_end].copy(),
+    'test': processed_df.iloc[val_end:].copy(),
+}
+
+processed_path = PROCESSED_DIR / "uniswap_v2_usdc_eth_processed.csv"
+processed_df.to_csv(processed_path, index=False)
+
+for split_name, split_df in split_dfs.items():
+    split_df.to_csv(PROCESSED_DIR / f"uniswap_v2_usdc_eth_{split_name}.csv", index=False)
+
+metadata = {
+    "dataset_name": "uniswap_v2_usdc_eth_processed",
+    "pool_address": POOL_ADDRESS,
+    "data_source": data_source,
+    "query_window": query_window,
+    "num_rows": int(len(processed_df)),
+    "num_unique_wallets": int(processed_df["sender"].nunique()),
+    "start_timestamp": processed_df["timestamp"].min().isoformat() if not processed_df.empty else None,
+    "end_timestamp": processed_df["timestamp"].max().isoformat() if not processed_df.empty else None,
+    "split_strategy": "chronological_80_10_10",
+    "columns": processed_columns,
+}
+
+with open(PROCESSED_DIR / "dataset_card.json", "w", encoding="utf-8") as fp:
+    json.dump(metadata, fp, indent=2)
 
 print(f"\nDataset Shape: {df.shape}")
 print("\nFirst 3 rows of processed DEX data:")
 print(df[['timestamp', 'sender', 'amountUSD']].head(3))
+print(f"\nSaved processed dataset: {processed_path}")
+print(f"Saved dataset metadata: {PROCESSED_DIR / 'dataset_card.json'}")
 
 # ==========================================
 # GENERATE REPORT FIGURES
